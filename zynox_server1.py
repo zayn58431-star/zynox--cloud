@@ -10,6 +10,10 @@ DB_FILE = "zynox_cloud.db"
 KEY_FILE = "secret.key"
 
 app = FastAPI(title="Zynox Cloud Memory (Prototype)")
+# Health check route
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "message": "Zynox Cloud is alive 🚀"}
 
 # ---- Key management: prefer env var, fallback to file, else generate ----
 def load_key() -> bytes:
