@@ -1,10 +1,13 @@
-# zynox_server1.py
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+# zynox_server1.py (FINAL S3 Persistent Storage Version)
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3, uuid, datetime, os, json
 from cryptography.fernet import Fernet
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+import tempfile # Used for creating temporary files for FileResponse
 
 # ----------------------------
 # Config
@@ -12,8 +15,12 @@ from cryptography.fernet import Fernet
 API_KEY = os.environ.get("ZYNX_API_KEY", "test-demo-key")
 DB_FILE = "zynox_cloud.db"
 KEY_FILE = "secret.key"
+# --- S3 Configuration ---
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+# ------------------------
 
-app = FastAPI(title="Zynox Cloud Memory (Prototype)")
+app = FastAPI(title="Zynox Cloud Memory (Prototype - S3 Enabled)")
 
 # Health check route
 @app.get("/ping")
@@ -22,7 +29,7 @@ def ping():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to your frontend domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,6 +45,25 @@ def load_key():
         return f.read()
 
 fernet = Fernet(load_key())
+
+# ----------------------------
+# S3 Client Initialization
+# ----------------------------
+s3 = None
+if S3_BUCKET_NAME:
+    try:
+        s3 = boto3.client(
+            's3',
+            region_name=AWS_REGION
+        )
+        print(f"✅ S3 Client initialized for bucket: {S3_BUCKET_NAME}")
+    except NoCredentialsError:
+        print("❌ AWS Credentials not found. S3 endpoints will fail.")
+    except Exception as e:
+        print(f"❌ S3 initialization failed: {e}")
+        s3 = None
+else:
+    print("⚠️ S3_BUCKET_NAME not set. S3 endpoints will fail.")
 
 # ----------------------------
 # Database Setup
@@ -110,12 +136,16 @@ def landing_page():
                 <li>Auto-tagging of emotions (happy/sad/angry) based on memory text</li>
                 <li>Protected with API Key system</li>
                 <li>Works inside virtual environment (<b>.venv</b>)</li>
+                <li> <b>Now supports PDF uploads & public sharing</b> (via **S3 Persistent Storage**)</li>
             </ul>
             <p>Explore full API docs 👉 <a href='/docs'>Swagger UI</a></p>
         </body>
     </html>
     """
 
+# ----------------------------
+# Memory Endpoints
+# ----------------------------
 @app.post("/v1/save")
 def save_memory(payload: UploadRequest, x_api_key: str | None = Header(None)):
     check_api_key(x_api_key)
@@ -185,7 +215,7 @@ def delete(mem_id: str, x_api_key: str | None = Header(None)):
     conn.commit()
     conn.close()
     return {"status":"ok", "deleted": mem_id}
-    
+
 @app.post("/v1/query/{owner_id}")
 def query_memories(owner_id: str, body: dict, x_api_key: str | None = Header(None)):
     check_api_key(x_api_key)
@@ -206,7 +236,6 @@ def query_memories(owner_id: str, body: dict, x_api_key: str | None = Header(Non
             continue
         tags = json.loads(r[2]) if r[2] else []
 
-        # match by emotion tag or keyword
         if (emotion and emotion in tags) or (keyword and keyword.lower() in decrypted.lower()):
             results.append({
                 "id": r[0],
@@ -217,3 +246,85 @@ def query_memories(owner_id: str, body: dict, x_api_key: str | None = Header(Non
             })
 
     return {"status": "ok", "results": results}
+
+# ----------------------------
+# MODIFIED: PDF Upload + Share (Using S3)
+# ----------------------------
+@app.post("/upload_pdf")
+async def upload_pdf(owner_id: str, file: UploadFile = File(...), x_api_key: str | None = Header(None)):
+    check_api_key(x_api_key)
+    
+    if not s3:
+        raise HTTPException(status_code=503, detail="S3 client not initialized. Check environment variables.")
+
+    # S3 object key format: pdfs/owner_id/uuid_filename.ext
+    file_key = f"pdfs/{owner_id}/{uuid.uuid4()}_{file.filename}"
+    
+    try:
+        # Upload content from a temporary location (or stream it directly)
+        file_content = await file.read()
+        
+        s3.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=file_key,
+            Body=file_content,
+            ContentType=file.content_type
+        )
+
+        # The public URL will now point to the S3 retrieval endpoint
+        # Note: The full public URL will be https://<your-render-domain>/files/pdfs/<owner_id>/<...>
+        public_url = f"/files/{file_key}"
+        return {"status": "ok", "url": public_url, "s3_key": file_key}
+        
+    except ClientError as e:
+        print(f"S3 Upload Error: {e}")
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e.response['Error']['Message']}")
+    except Exception as e:
+        print(f"General Upload Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during upload.")
+
+
+@app.get("/files/{file_key:path}")
+async def get_pdf(file_key: str):
+    """
+    Retrieves the file from S3 using the full S3 key and returns it.
+    The ':path' allows the key to contain slashes.
+    """
+    if not s3:
+        raise HTTPException(status_code=503, detail="S3 client not initialized.")
+        
+    # Use tempfile to ensure cleanup in a managed way
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        try:
+            # Retrieve the file object from S3
+            response = s3.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+            
+            # Read and write the file content to the temporary file
+            file_content = response['Body'].read()
+            tmp.write(file_content)
+            tmp_path = tmp.name
+            
+            # Get necessary metadata
+            content_type = response.get('ContentType', 'application/octet-stream')
+            filename = file_key.split('/')[-1]
+
+            # Return the file response, using a background task to clean up the temp file
+            return FileResponse(
+                path=tmp_path,
+                media_type=content_type,
+                filename=filename,
+                background=os.remove(tmp_path) # Clean up the temporary file after sending
+            )
+            
+        except ClientError as e:
+            if os.path.exists(tmp.name):
+                os.remove(tmp.name)
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                raise HTTPException(status_code=404, detail="File not found in S3")
+            print(f"S3 Download Error: {e}")
+            raise HTTPException(status_code=500, detail=f"S3 download failed: {e.response['Error']['Message']}")
+        except Exception as e:
+            if os.path.exists(tmp.name):
+                os.remove(tmp.name)
+            print(f"General Download Error: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error during download.")
